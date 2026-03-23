@@ -29,6 +29,7 @@ import {
   projectService,
   routineService,
   workProductService,
+  resolveCeoAgentId,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
@@ -238,6 +239,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       unreadForUserId,
       projectId: req.query.projectId as string | undefined,
       parentId: req.query.parentId as string | undefined,
+      goalId: req.query.goalId as string | undefined,
       labelId: req.query.labelId as string | undefined,
       originKind: req.query.originKind as string | undefined,
       originId: req.query.originId as string | undefined,
@@ -1002,6 +1004,40 @@ export function issueRoutes(db: Db, storage: StorageService) {
           .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
       }
     })();
+
+    // Goal completion detection: when an issue with a goalId transitions to done/cancelled,
+    // check if all issues under that goal are complete
+    const issueBecameTerminal =
+      issue.goalId &&
+      (existing.status !== "done" && existing.status !== "cancelled") &&
+      (issue.status === "done" || issue.status === "cancelled");
+
+    if (issueBecameTerminal) {
+      void (async () => {
+        const openCount = await goalsSvc.countOpenIssues(issue.goalId!);
+        if (openCount === 0) {
+          const goal = await goalsSvc.getById(issue.goalId!);
+          if (goal) {
+            const targetAgentId = goal.ownerAgentId ?? (await resolveCeoAgentId(db, goal.companyId));
+            if (targetAgentId) {
+              heartbeat
+                .wakeup(targetAgentId, {
+                  source: "automation",
+                  triggerDetail: "system",
+                  reason: "goal_work_complete",
+                  payload: { goalId: goal.id },
+                  contextSnapshot: {
+                    goalId: goal.id,
+                    wakeReason: "goal_work_complete",
+                    source: "issue.completed",
+                  },
+                })
+                .catch((err) => logger.warn({ err, goalId: goal.id }, "failed to wake agent on goal work complete"));
+            }
+          }
+        }
+      })();
+    }
 
     res.json({ ...issue, comment });
   });
